@@ -15,7 +15,7 @@ const GIST_FILE = "fund-limit.json";
 
 const FUNDS = [
   { code: "018738", name: "博时标普500ETF联接E", key: null },          // 顶层
-  { code: "021000", name: "南方纳斯达克100指数发起I", key: "nasdaq" }, // 子对象
+  { code: "021000", name: "南方纳斯达克100指数发起I", key: "nasdaq", nf: true }, // 子对象，南方官方接口取数字
 ];
 
 // 从主站 HTML 解析交易状态（与旧逻辑一致）
@@ -57,6 +57,38 @@ async function fetchMaxSg(code) {
   } catch (e) { return null; }
 }
 
+// 南方基金官网「产品状态及限额」官方接口：一次返回全量基金，remark 里写明大额申购限额数字。
+// 这是直销专属份额(如 021000)唯一能拿到具体金额的来源（天天基金只报状态词）。
+async function fetchNfLimit(code) {
+  const url = "https://www.nffund.com/nfwebApi/customer/subscriptionAndRedemptionStatus";
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Referer": "https://www.nffund.com/new/transaction-guide/product-status-and-limits.html",
+        "User-Agent": "Mozilla/5.0",
+      },
+      body: "{}",
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (!j || j.code !== "ETS-5BP00000" || !j.data || !j.data.fundlist) return null;
+    const f = j.data.fundlist.find(x => x.fundCode === code);
+    if (!f) return null;
+    const remark = String(f.remark || "");
+    // 兼容「限额调整为200元」「限额3000万元」「限额为100万元」等写法
+    const m = remark.match(/限额(?:调整为|为)?\s*([\d.]+)\s*(万元|元)/);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    if (!isFinite(n) || n <= 0) return null;
+    return { amount: n, unit: m[2], remark: remark };
+  } catch (e) {
+    console.log("nfApi error:", e.message);
+    return null;
+  }
+}
+
 async function fetchFund(f) {
   console.log("fetch:", f.code, f.name);
   const resp = await fetch("https://fund.eastmoney.com/" + f.code + ".html", {
@@ -67,13 +99,21 @@ async function fetchFund(f) {
   const parsed = parseStatus(html);
   if (parsed.state === "未知") throw new Error("解析结果未知，拒绝写入 (" + f.code + ")");
 
-  // 额度数字：优先主站 HTML 的「单日累计购买上限」，其次移动端 MAXSG。
-  let amount = parsed.amount;
+  // 额度数字，按来源优先级：
+  //   1) 南方基金官方接口（nf:true 的直销专属份额，唯一有具体金额）
+  //   2) 天天基金主站 HTML「单日累计购买上限」
+  //   3) 天天基金移动端 MAXSG
+  let amount = null, unit = "元";
+  if (f.nf) {
+    const nf = await fetchNfLimit(f.code);
+    if (nf) { amount = nf.amount; unit = nf.unit; }
+  }
+  if (amount === null) amount = parsed.amount;
   if (amount === null) amount = await fetchMaxSg(f.code);
   if (amount !== null) {
     parsed.state = "限大额";
     parsed.value = String(parseFloat(amount.toFixed(2)));
-    parsed.unit = "元";
+    parsed.unit = unit;
     parsed.amount = amount;
   }
   console.log("parsed:", f.code, JSON.stringify(parsed));
