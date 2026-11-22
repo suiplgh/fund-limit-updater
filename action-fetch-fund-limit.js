@@ -1,17 +1,24 @@
 #!/usr/bin/env node
 /* ============================================================
-   GitHub Actions 版 · 抓取博时标普500ETF联接E(018738)当日限购额度
-   → 写 Gist 的 fund-limit.json → API 权威回读校验
+   GitHub Actions 版 · 抓取两只基金的当日限购额度
+     1) 博时标普500ETF联接E (018738) → fund-limit.json 顶层（兼容旧结构）
+     2) 南方纳斯达克100指数发起(QDII)I (021000) → nasdaq 子对象
+   → 写 Gist → API 权威回读校验
 
-   与本地 tools/fetch-fund-limit.js 解析逻辑完全一致。
-   区别：token 从环境变量 GIST_TOKEN（仓库 Secret）读取，不依赖本地凭据文件。
+   数据源：
+     - 天天基金主站 HTML 抓「交易状态」→ state（暂停/限大额/开放）
+     - 天天基金移动端 MAXSG 接口 → 额度数字（有则显示数字，无则显示状态词）
+   token 从环境变量 GIST_TOKEN（仓库 Secret）读取。
    ============================================================ */
-const FUND_CODE = "018738";
-const FUND_URL = "https://fund.eastmoney.com/" + FUND_CODE + ".html";
 const GIST_ID = "96bbc2e049cd6b2b31bf1f6bc3d2f43c";
 const GIST_FILE = "fund-limit.json";
 
-// 解析交易状态（与本地版逐字一致）
+const FUNDS = [
+  { code: "018738", name: "博时标普500ETF联接E", key: null },          // 顶层
+  { code: "021000", name: "南方纳斯达克100指数发起I", key: "nasdaq" }, // 子对象
+];
+
+// 从主站 HTML 解析交易状态（与旧逻辑一致）
 function parseStatus(html) {
   if (typeof html !== "string" || html.indexOf("交易状态") < 0) throw new Error("页面内容异常");
   const seg = html.match(/交易状态：([\s\S]{0,500}?)<\/div>/);
@@ -33,16 +40,49 @@ function parseStatus(html) {
   return out;
 }
 
-function buildRecord(parsed) {
-  const now = new Date();
-  // 转成北京时间日期（UTC+8）
+// 从移动端接口取额度数字 MAXSG（可能是 "--"）
+async function fetchMaxSg(code) {
+  const url = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNBasicInformation?FCODE=" +
+    code + "&deviceid=1&plat=Android&product=EFund&version=6.5.5";
+  try {
+    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const d = j && j.Datas;
+    if (!d || typeof d !== "object") return null;
+    const v = String(d.MAXSG == null ? "" : d.MAXSG).trim();
+    if (!v || v === "--") return null;
+    const n = parseFloat(v.replace(/,/g, ""));
+    return isFinite(n) && n > 0 ? n : null;
+  } catch (e) { return null; }
+}
+
+async function fetchFund(f) {
+  console.log("fetch:", f.code, f.name);
+  const resp = await fetch("https://fund.eastmoney.com/" + f.code + ".html", {
+    headers: { "User-Agent": "Mozilla/5.0" },
+  });
+  if (!resp.ok) throw new Error("HTTP " + resp.status + " (" + f.code + ")");
+  const html = await resp.text();
+  const parsed = parseStatus(html);
+  if (parsed.state === "未知") throw new Error("解析结果未知，拒绝写入 (" + f.code + ")");
+
+  // 额度数字：优先主站 HTML 的「单日累计购买上限」，其次移动端 MAXSG。
+  let amount = parsed.amount;
+  if (amount === null) amount = await fetchMaxSg(f.code);
+  if (amount !== null) {
+    parsed.state = "限大额";
+    parsed.value = String(parseFloat(amount.toFixed(2)));
+    parsed.unit = "元";
+    parsed.amount = amount;
+  }
+  console.log("parsed:", f.code, JSON.stringify(parsed));
+  return parsed;
+}
+
+function fmtDate(now) {
   const bj = new Date(now.getTime() + 8 * 60 * 60 * 1000);
-  const date = bj.getUTCFullYear() + "-" + String(bj.getUTCMonth() + 1).padStart(2, "0") + "-" + String(bj.getUTCDate()).padStart(2, "0");
-  return {
-    code: FUND_CODE, name: "博时标普500ETF联接E",
-    state: parsed.state, value: parsed.value, unit: parsed.unit, amount: parsed.amount,
-    date: date, ts: now.getTime(), source: "fund.eastmoney.com"
-  };
+  return bj.getUTCFullYear() + "-" + String(bj.getUTCMonth() + 1).padStart(2, "0") + "-" + String(bj.getUTCDate()).padStart(2, "0");
 }
 
 function ghApi(method, urlPath, body, token) {
@@ -63,21 +103,29 @@ async function main() {
   const token = process.env.GIST_TOKEN;
   if (!token) throw new Error("缺少 GIST_TOKEN 环境变量");
 
-  console.log("fetch:", FUND_URL);
-  const resp = await fetch(FUND_URL, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  const html = await resp.text();
-  const parsed = parseStatus(html);
-  const record = buildRecord(parsed);
-  console.log("parsed:", JSON.stringify(record));
-  if (parsed.state === "未知") throw new Error("解析结果未知，拒绝写入");
+  const p0 = await fetchFund(FUNDS[0]);
+  const p1 = await fetchFund(FUNDS[1]);
+  const ts = Date.now();
+  const date = fmtDate(new Date(ts));
 
+  // 顶层 = 标普（保持旧结构字段，兼容旧版小组件）；nasdaq 子对象 = 南方纳指I
+  const record = {
+    code: FUNDS[0].code, name: FUNDS[0].name,
+    state: p0.state, value: p0.value, unit: p0.unit, amount: p0.amount,
+    date: date, ts: ts, source: "fund.eastmoney.com",
+    nasdaq: {
+      code: FUNDS[1].code, name: FUNDS[1].name,
+      state: p1.state, value: p1.value, unit: p1.unit, amount: p1.amount,
+    },
+  };
   const content = JSON.stringify(record);
+  console.log("record:", content);
+
   const updated = await ghApi("PATCH", "/gists/" + GIST_ID, { files: { [GIST_FILE]: { content } } }, token);
   if (!updated.files[GIST_FILE]) throw new Error("更新后未见 " + GIST_FILE);
   console.log("已推送 Gist:", GIST_FILE);
 
-  // API 权威回读校验（PATCH 后 API 有极短延迟，重试最多 3 次）
+  // API 权威回读校验（PATCH 后极短延迟，重试最多 3 次）
   let ok = false;
   for (let i = 0; i < 3; i++) {
     if (i > 0) await new Promise(r => setTimeout(r, 2000));
