@@ -77,10 +77,15 @@ async function main() {
   if (!updated.files[GIST_FILE]) throw new Error("更新后未见 " + GIST_FILE);
   console.log("已推送 Gist:", GIST_FILE);
 
-  // API 权威回读校验
-  const auth = await ghApi("GET", "/gists/" + GIST_ID, null, token);
-  const remote = JSON.parse(auth.files[GIST_FILE].content);
-  if (remote.ts !== record.ts) throw new Error("API 回读校验不一致！");
+  // API 权威回读校验（PATCH 后 API 有极短延迟，重试最多 3 次）
+  let ok = false;
+  for (let i = 0; i < 3; i++) {
+    if (i > 0) await new Promise(r => setTimeout(r, 2000));
+    const auth = await ghApi("GET", "/gists/" + GIST_ID, null, token);
+    const remote = JSON.parse(auth.files[GIST_FILE].content);
+    if (remote.ts === record.ts) { ok = true; break; }
+  }
+  if (!ok) throw new Error("API 回读校验不一致！");
   console.log("API 回读校验一致, ts=", record.ts);
   console.log("READ URL: https://gist.githubusercontent.com/suiplgh/" + GIST_ID + "/raw/" + GIST_FILE);
   console.log("DONE");
