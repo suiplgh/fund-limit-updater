@@ -12,4 +12,9 @@ jobs:
       - name: Fetch and write fund-limit.json to Gist
         env:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        continue-on-error: true
         run: node action-fetch-fund-limit.js
+      - name: Fetch and write portfolio.json to Gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: node action-fetch-portfolio.js
