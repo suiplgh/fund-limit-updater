@@ -14,9 +14,48 @@ const GIST_ID = "96bbc2e049cd6b2b31bf1f6bc3d2f43c";
 const GIST_FILE = "fund-limit.json";
 
 const FUNDS = [
-  { code: "018738", name: "博时标普500ETF联接E", key: null },          // 顶层
+  { code: "018738", name: "博时标普500ETF联接E", key: null, bs: true }, // 顶层，博时官方限大额表补数字
   { code: "021000", name: "南方纳斯达克100指数发起I", key: "nasdaq", nf: true }, // 子对象，南方官方接口取数字
 ];
+
+// 博时官网「旗下QDII基金限大额一览表」（固定文章 infoid=2962297，服务端直出 HTML，持续维护）。
+// E 份额是直销专属，表里 A/C/E 同行，限额可能分「博时直销/博时财富/代销渠道」，取第一个数字（通常即博时直销）。
+const BOSERA_LIMIT_URL = "https://www.bosera.com/column/infoDetail.do?classid=000200020011000200010001&infoid=2962297";
+
+function parseBoseraLimit(html, code) {
+  const rows = html.split(/<tr[^>]*>/i);
+  const clean = x => x.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  for (const r of rows) {
+    if (r.indexOf(code) < 0) continue;
+    const cells = r.match(/<td[^>]*>([\s\S]*?)<\/td>/gi) || [];
+    if (cells.length < 2) continue;
+    const share = clean(cells[0]);
+    if (share.indexOf(code) < 0) continue; // 确保是代码所在单元格，不串到其它份额
+    const limit = clean(cells[1]);
+    const m = limit.match(/([\d,.]+)\s*(万元|元)/);
+    if (m) {
+      const n = parseFloat(m[1].replace(/,/g, ""));
+      const unit = m[2];
+      if (isFinite(n) && n > 0) return { state: "限大额", value: String(parseFloat(n.toFixed(2))), unit: unit, amount: n * (unit === "万元" ? 10000 : 1) };
+    }
+    if (/暂停/.test(limit)) return { state: "暂停", value: "暂停", unit: "", amount: null };
+    if (/开放|不限/.test(limit)) return { state: "开放", value: "不限", unit: "", amount: null };
+  }
+  return null;
+}
+
+async function fetchBoseraLimit(code) {
+  try {
+    const r = await fetch(BOSERA_LIMIT_URL, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!r.ok) return null;
+    const html = await r.text();
+    if (html.indexOf("限大额") < 0 && html.indexOf("018738") < 0) return null; // 页面结构异常，拒绝
+    return parseBoseraLimit(html, code);
+  } catch (e) {
+    console.log("bsApi error:", e.message);
+    return null;
+  }
+}
 
 // 从主站 HTML 解析交易状态（与旧逻辑一致）
 function parseStatus(html) {
@@ -99,22 +138,37 @@ async function fetchFund(f) {
   const parsed = parseStatus(html);
   if (parsed.state === "未知") throw new Error("解析结果未知，拒绝写入 (" + f.code + ")");
 
-  // 额度数字，按来源优先级：
-  //   1) 南方基金官方接口（nf:true 的直销专属份额，唯一有具体金额）
-  //   2) 天天基金主站 HTML「单日累计购买上限」
-  //   3) 天天基金移动端 MAXSG
-  let amount = null, unit = "元";
+  // 额度数字，按来源优先级（官方源优先）：
+  //   - nf:true  南方基金官方接口（021000 专属，唯一能拿到具体金额）
+  //   - bs:true  博时官网限大额一览表（018738 专属，恢复限购后能拿到具体金额）
+  //   - 兜底     天天基金主站 HTML「单日累计购买上限」→ 移动端 MAXSG
+  // 官方源若明确给出状态（暂停/开放），直接采用；若给出限大额数字，用它覆盖。
+  let amount = null, unit = "元", officialState = null;
   if (f.nf) {
     const nf = await fetchNfLimit(f.code);
     if (nf) { amount = nf.amount; unit = nf.unit; }
   }
-  if (amount === null) amount = parsed.amount;
-  if (amount === null) amount = await fetchMaxSg(f.code);
-  if (amount !== null) {
-    parsed.state = "限大额";
-    parsed.value = String(parseFloat(amount.toFixed(2)));
-    parsed.unit = unit;
-    parsed.amount = amount;
+  if (f.bs) {
+    const bs = await fetchBoseraLimit(f.code);
+    if (bs) {
+      if (bs.state !== "限大额") officialState = bs;         // 暂停/开放：官方权威
+      else if (bs.amount !== null) { amount = bs.amount; unit = bs.unit; } // 限大额+数字
+    }
+  }
+  if (officialState) {
+    parsed.state = officialState.state;
+    parsed.value = officialState.value;
+    parsed.unit = officialState.unit;
+    parsed.amount = officialState.amount;
+  } else {
+    if (amount === null) amount = parsed.amount;
+    if (amount === null) amount = await fetchMaxSg(f.code);
+    if (amount !== null) {
+      parsed.state = "限大额";
+      parsed.value = String(parseFloat(amount.toFixed(2)));
+      parsed.unit = unit;
+      parsed.amount = amount;
+    }
   }
   console.log("parsed:", f.code, JSON.stringify(parsed));
   return parsed;
