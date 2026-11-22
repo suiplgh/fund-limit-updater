@@ -12,12 +12,14 @@
    按份数加权求和。QDII（标普/纳指）净值天然晚一天，硬拼不同日期会失真，
    所以只在同一净值日上算，宁可日期旧一天也要口径一致。
 
-   数据源：天天基金历史净值接口 api.fund.eastmoney.com/f10/lsjz（JZZZL=官方日增长率%）。
+   数据源：天天基金【移动端】历史净值接口 fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList
+   （JZZZL=官方日增长率%）。⚠️ 用移动端域名而非 api.fund.eastmoney.com —— 后者在国内能连，
+   但 GitHub Actions 海外 runner 连不上（ETIMEDOUT）；移动端域名已由 fund-limit action 验证海外可连通。
    token 从环境变量 GIST_TOKEN（仓库 Secret）读取。
    ============================================================ */
 const GIST_ID = "96bbc2e049cd6b2b31bf1f6bc3d2f43c";
 const GIST_FILE = "portfolio.json";
-const LSJZ = "https://api.fund.eastmoney.com/f10/lsjz?fundCode=CODE&pageIndex=1&pageSize=8&callback=";
+const LSJZ = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList?FCODE=__CODE__&pageIndex=1&pageSize=8&plat=Android&product=EFund&version=6.5.5&deviceid=1";
 
 const FUNDS = [
   { code: "021550", name: "博中证红利低波100联接A", shares: 1 },
@@ -36,17 +38,20 @@ function num(v) {
 }
 
 async function fetchFund(fund) {
-  const url = LSJZ.replace("CODE", fund.code);
-  const r = await fetch(url, {
-    headers: {
-      Referer: "https://fundf10.eastmoney.com/",
-      "User-Agent": "Mozilla/5.0",
-    },
-  });
-  if (!r.ok) throw new Error(fund.code + " HTTP " + r.status);
-  const j = await r.json();
-  const list = j && j.Data && j.Data.LSJZList;
-  if (!Array.isArray(list) || !list.length) throw new Error(fund.code + " 无净值数据");
+  const url = LSJZ.replace("__CODE__", fund.code);
+  // 移动端接口对并发敏感（6 只并发会限流返回空），串行抓 + 单只重试 2 次。
+  let j = null;
+  for (let attempt = 0; attempt < 3 && !j; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 800));
+    try {
+      const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      if (!r.ok) continue;
+      const parsed = await r.json();
+      if (parsed && Array.isArray(parsed.Datas) && parsed.Datas.length) j = parsed;
+    } catch (e) { /* 重试 */ }
+  }
+  if (!j) throw new Error(fund.code + " 无净值数据（重试 3 次）");
+  const list = j.Datas;
   // date -> 日增长率%（只保留有数字的）
   const byDate = {};
   list.forEach((row) => {
@@ -80,10 +85,9 @@ async function main() {
   const token = process.env.GIST_TOKEN;
   if (!token) throw new Error("缺少 GIST_TOKEN 环境变量");
 
-  // 全部发起、最后逐个收：并行抓，缩短 Actions 运行时间
-  const pending = FUNDS.map((f) => fetchFund(f));
+  // 串行抓（移动端接口并发限流），单只内部已带 3 次重试。
   const got = [];
-  for (let i = 0; i < pending.length; i++) got.push(await pending[i]);
+  for (let i = 0; i < FUNDS.length; i++) got.push(await fetchFund(FUNDS[i]));
 
   // 找共同净值日：每只基金都有 JZZZL 的日期，取最近一天
   let common = got[0].dates.filter((d) => got.every((g) => g.byDate[d] !== undefined));
