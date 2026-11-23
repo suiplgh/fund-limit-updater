@@ -1,0 +1,20 @@
+name: probe-net
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe endpoints
+        run: |
+          for u in \
+            "https://qt.gtimg.cn/q=sh518880" \
+            "https://push2.eastmoney.com/api/qt/stock/get?secid=1.518880&fields=f43,f170" \
+            "https://hq.sinajs.cn/list=sh518880" \
+            "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNHisNetList?FCODE=021550&pageIndex=1&pageSize=1&plat=Android&product=EFund&version=6.5.5&deviceid=1"
+          do
+            echo "URL: $u"
+            curl -sS --max-time 12 -H "Referer: https://finance.sina.com.cn" "$u" | head -c 180
+            echo ""
+            echo "---END---"
+          done
