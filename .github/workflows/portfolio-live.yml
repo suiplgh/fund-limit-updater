@@ -1,0 +1,15 @@
+name: Portfolio Live (every 30 min)
+on:
+  # 每 30 分钟跑一次（UTC）。A股交易时段实时价，休市/夜间取收盘价；美股休市取隔夜收盘。
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch live quotes and write portfolio.json to Gist
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: node action-fetch-portfolio.js
